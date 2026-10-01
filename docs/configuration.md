@@ -536,6 +536,16 @@ Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_
 
 Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
 
+## Quota drain alert threshold (config/quota-drain-alert-threshold)
+
+Each task record carries an opening and a closing quota reading (see `bin/fm-quota-accounting-lib.sh`), and teardown measures the drain between them in percentage points of one provider quota window - not tokens, which quota-axi cannot observe.
+When that measured drain exceeds the threshold, teardown appends a `check` event to the durable wake queue naming the task and the measured drain, so the first mate is woken about a heavy task instead of it only being recorded.
+
+The local, gitignored `config/quota-drain-alert-threshold` file holds the threshold as its first non-empty line, a non-negative number of percentage points.
+An absent or unparseable file means the default, 10.
+Only a `measured` delta can alert; with concurrent workers the drain is an upper bound shared with everything else in the window, and the alert text says so.
+Alerting is best-effort and never blocks a cleanup.
+
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
 When away-mode injection wedges past `FM_MAX_DEFER_SECS`, the sub-supervisor raises a loud, rate-limited alarm.
@@ -2314,6 +2324,7 @@ FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in C
 FM_CODEX_WATCH_CHECKPOINT_AWAY=3600  # requested away checkpoint bound on a home that runs the supervision host; longer of this and attended bound, capped at 27000
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh, and per state-database run-inventory read behind a capped AXI overview
 FM_TEARDOWN_NM_TIMEOUT=10    # seconds allowed per no-mistakes query or abort inside fm-teardown.sh
+FM_QUOTA_ACCOUNTING_TIMEOUT=20   # seconds bounding each quota-axi read taken for per-task quota accounting at spawn and teardown (bin/fm-quota-accounting-lib.sh); invalid or zero values use 20, and a read that misses the bound is recorded as unavailable instead of blocking the dispatch or cleanup
 FM_CREW_STATE_RUNS_LIMIT=200  # plain runs-ledger rows scanned for fallback attribution; does not change the CLI's AXI overview window (selection owner: bin/fm-nm-run-lib.sh)
 FM_TEARDOWN_NM_RUNS_LIMIT=200  # recent no-mistakes run rows scanned to prove an unresolved-head parked run belongs to teardown's task
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by watcher triage: the working/paused classification, and the wedge timer's parked-gate wait evidence
