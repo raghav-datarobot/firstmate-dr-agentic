@@ -3,10 +3,9 @@
 #
 # bin/fm-lint.sh is the single owner invoked by CI
 # (.github/workflows/ci.yml) and by the pre-push gate (.no-mistakes.yaml
-# commands.lint). CI runs its two full-rigor canonical partitions; the local
-# gate uses its context-selected default. Their selection differs deliberately,
-# while this owner keeps analysis flags, configuration, and tool versions from
-# drifting.
+# commands.lint). CI and the local gate deliberately select different roots;
+# bin/fm-lint.sh owns their analysis modes, memory fallback, configuration,
+# and tool versions.
 # Regression origin: with no commands.lint configured, the local no-mistakes
 # lint step never ran the deterministic shell lint, so PRs passed local
 # validation yet failed CI on info/warning findings such as SC2015, SC1007, and
@@ -159,6 +158,7 @@ test_help_reports_the_complete_interface() {
   assert_contains "$help" "--list-files" "fm-lint.sh --help omitted --list-files"
   assert_contains "$help" "--help" "fm-lint.sh --help omitted --help"
   assert_contains "$help" "--fast" "fm-lint.sh --help omitted --fast"
+  assert_contains "$help" "--changed" "fm-lint.sh --help omitted --changed"
   assert_contains "$help" "SC1091" "fm-lint.sh --help omitted the local SC1091 exclusion"
   assert_contains "$help" "SC2034" "fm-lint.sh --help omitted the local SC2034 exclusion"
   assert_contains "$help" "SC2153" "fm-lint.sh --help omitted the local SC2153 exclusion"
@@ -171,8 +171,9 @@ test_list_files_reports_the_shell_inventory() {
   # CI=true forces the full canonical set regardless of the ambient branch or
   # working-tree diff a local test run happens to have, so this stays a pure
   # inventory check independent of fm-lint.sh's own changed-file mode below.
+  # Hidden scripts are outside the documented shell-glob inventory.
   listed=$(CI=true "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "fm-lint.sh --list-files did not return the complete shell inventory"
   pass "fm-lint.sh --list-files reports the complete shell inventory"
@@ -214,7 +215,16 @@ test_canonical_partitions_preserve_full_lint() {
       || fail "partition $part did not stream an end record per root"
   done
   [ "$(LC_ALL=C sort "$tmp/union")" = "$all" ] || fail "lint partitions lose or duplicate canonical roots"
-  for option in 0of2 3of2 1of3; do
+  : > "$tmp/union4"
+  for part in 1of4 2of4 3of4 4of4; do
+    selected=$(CI=false GITHUB_ACTIONS=false "$LINT" --partition "$part" --list-files) \
+      || fail "partition $part must list canonical roots"
+    printf '%s\n' "$selected" >> "$tmp/union4"
+  done
+  [ "$(LC_ALL=C sort "$tmp/union4")" = "$all" ] || fail "four lint partitions lose or duplicate canonical roots"
+  CI=false GITHUB_ACTIONS=false "$LINT" --partition 1of3 --list-files >/dev/null \
+    || fail "generic <k>of<n> must accept 1of3"
+  for option in 0of2 3of2 1of0; do
     rc=0
     "$LINT" --partition "$option" --list-files > "$tmp/refused" 2>&1 || rc=$?
     [ "$rc" = 2 ] || fail "invalid partition $option was not refused"
@@ -225,7 +235,7 @@ test_canonical_partitions_preserve_full_lint() {
   rc=0
   "$LINT" --partition 1of2 bin/fm-lint.sh > "$tmp/refused" 2>&1 || rc=$?
   [ "$rc" = 2 ] || fail "partition accepted an explicit subset"
-  pass "two canonical lint partitions preserve complete source-aware coverage and reject weakened modes"
+  pass "canonical lint partitions preserve complete source-aware coverage and reject weakened modes"
 }
 
 # fm_lint_stub_git <fakebin-dir>: install a git stub for the changed-file mode
@@ -239,6 +249,11 @@ test_canonical_partitions_preserve_full_lint() {
 #   FM_TEST_GIT_MERGE_BASE_OK    1 (default) or 0
 #   FM_TEST_GIT_MERGE_BASE       merge-base value to print when OK
 #   FM_TEST_GIT_DIFF_FILE        path to a file of NUL-separated changed paths
+#   FM_TEST_GIT_NAME_STATUS_FILE path to a git diff --name-status listing
+#                                (tab-separated status and paths). When unset,
+#                                the name-status stub synthesizes M lines from
+#                                FM_TEST_GIT_DIFF_FILE so existing tests keep
+#                                driving both collectors from one fixture.
 fm_lint_stub_git() {
   local fakebin=$1
   cat > "$fakebin/git" <<'SH'
@@ -272,6 +287,44 @@ case "$*" in
     fi
     exit 0
     ;;
+  "diff --name-only --diff-filter=ACMR "*)
+    if [ -n "${FM_TEST_GIT_DIFF_FILE:-}" ] && [ -f "$FM_TEST_GIT_DIFF_FILE" ]; then
+      after=0
+      specs=
+      for arg in $*; do
+        if [ "$after" = 1 ]; then
+          specs="$specs $arg"
+        elif [ "$arg" = -- ]; then
+          after=1
+        fi
+      done
+      tr '\0' '\n' < "$FM_TEST_GIT_DIFF_FILE" | while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ -z "${specs# }" ]; then
+          printf '%s\n' "$path"
+          continue
+        fi
+        for spec in $specs; do
+          if [ "$path" = "$spec" ]; then
+            printf '%s\n' "$path"
+            break
+          fi
+        done
+      done
+    fi
+    exit 0
+    ;;
+  "diff --name-status --diff-filter=ACDMR "*)
+    if [ -n "${FM_TEST_GIT_NAME_STATUS_FILE:-}" ] && [ -f "$FM_TEST_GIT_NAME_STATUS_FILE" ]; then
+      cat "$FM_TEST_GIT_NAME_STATUS_FILE"
+    elif [ -n "${FM_TEST_GIT_DIFF_FILE:-}" ] && [ -f "$FM_TEST_GIT_DIFF_FILE" ]; then
+      tr '\0' '\n' < "$FM_TEST_GIT_DIFF_FILE" | while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        printf 'M\t%s\n' "$path"
+      done
+    fi
+    exit 0
+    ;;
   *)
     exit 1
     ;;
@@ -286,6 +339,14 @@ fm_lint_write_diff_file() {
   local file=$1
   shift
   printf '%s\0' "$@" > "$file"
+}
+
+# fm_lint_write_name_status <file> <line>...: writes `git diff --name-status`
+# lines for FM_TEST_GIT_NAME_STATUS_FILE (status, then tab-separated paths).
+fm_lint_write_name_status() {
+  local file=$1
+  shift
+  printf '%s\n' "$@" > "$file"
 }
 
 # fm_lint_stub_shellcheck <fakebin-dir> <log-file>: install a ShellCheck stub
@@ -510,7 +571,7 @@ test_changed_mode_lints_only_the_changed_file() {
   log="$tmp/shellcheck.log"
   fm_lint_stub_shellcheck "$fakebin" "$log"
   diff_file="$tmp/diff.nul"
-  target="bin/fm-install-shellcheck.sh"
+  target="bin/fm-afk-launch.sh"
   fm_lint_write_diff_file "$diff_file" "$target" "README.md"
 
   # Clear the ambient CI/GITHUB_ACTIONS signals so changed-file mode is actually
@@ -529,7 +590,7 @@ test_ci_forces_full_lint_even_with_empty_diff() {
   # No git stub: CI=true must short-circuit fm-lint.sh's mode selection before
   # it ever consults git, so this proves CI wins regardless of local diff state.
   listed=$(CI=true "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "CI=true did not force the full canonical file set"
   pass "fm-lint.sh forces a full lint in CI even when the local diff would be empty"
@@ -545,7 +606,7 @@ test_main_branch_forces_full_lint() {
   # not the ambient CI signal a real CI run would otherwise supply.
   listed=$(PATH="$fakebin:$PATH" GITHUB_ACTIONS='' CI='' \
     FM_TEST_GIT_BRANCH=main "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "fm-lint.sh did not force a full lint when HEAD is on main"
   pass "fm-lint.sh forces a full lint when HEAD is on main"
@@ -670,8 +731,10 @@ test_changed_mode_invokes_shellcheck_once_per_root() {
   flag_log="$tmp/flags.log"
   fm_lint_stub_shellcheck "$fakebin" "$log"
   diff_file="$tmp/diff.nul"
-  first="bin/fm-install-shellcheck.sh"
-  second="bin/fm-lint-workflows.sh"
+  first="bin/fm-afk-launch.sh"
+  # Pick two entrypoints that nothing else `# shellcheck source=`s: a sourced
+  # helper would upgrade this pair to the full canonical set.
+  second="bin/fm-on.sh"
   fm_lint_write_diff_file "$diff_file" "$first" "$second"
 
   out=$(PATH="$fakebin:$PATH" GITHUB_ACTIONS='' CI='' FM_LINT_JOBS=1 \
@@ -773,7 +836,7 @@ test_fast_mode_on_a_local_branch_keeps_source_following() {
   mode_log="$tmp/mode.log"
   fm_lint_stub_shellcheck "$fakebin" "$log"
   diff_file="$tmp/diff.nul"
-  target="bin/fm-install-shellcheck.sh"
+  target="bin/fm-afk-launch.sh"
   fm_lint_write_diff_file "$diff_file" "$target"
 
   out=$(PATH="$fakebin:$PATH" GITHUB_ACTIONS='' CI='' FM_LINT_JOBS=1 \
@@ -846,6 +909,189 @@ SH
 fm_lint_nox_one_root() {
   local index=$1 path=$2 outdir=$3
   shellcheck --norc --format gcc -- "$path" > "$outdir/$index" || true
+}
+
+test_changed_flag_keeps_source_following_in_ci() {
+  local tmp fakebin log flag_log mode_log diff_file out target
+  tmp=$(fm_test_tmproot fm-lint-changed-flag)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  log="$tmp/shellcheck.log"
+  flag_log="$tmp/flags.log"
+  mode_log="$tmp/mode.log"
+  fm_lint_stub_shellcheck "$fakebin" "$log"
+  diff_file="$tmp/diff.nul"
+  target="bin/fm-afk-launch.sh"
+  fm_lint_write_diff_file "$diff_file" "$target" "README.md"
+
+  out=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true FM_LINT_JOBS=1 \
+    FM_TEST_GIT_BRANCH=feature \
+    FM_TEST_GIT_DIFF_FILE="$diff_file" \
+    FM_TEST_FLAG_LOG="$flag_log" FM_TEST_MODE_LOG="$mode_log" \
+    "$LINT" --changed --partition 1of4 2>&1) \
+    || fail "CI --changed lint failed"$'\n'"$out"
+  [ "$(cat "$log")" = "$target" ] \
+    || fail "CI --changed did not lint exactly the changed canonical file"$'\n'"logged: $(cat "$log")"
+  [ "$(cat "$mode_log")" = on ] \
+    || fail "CI --changed disabled dataflow analysis"
+  fm_lint_assert_flag_log "$flag_log" yes none
+  pass "fm-lint.sh --changed in CI keeps source-aware analysis on the changed set"
+}
+
+test_changed_flag_upgrades_when_lint_definition_changes() {
+  local tmp fakebin listed expected diff_file out
+  tmp=$(fm_test_tmproot fm-lint-changed-upgrade)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  diff_file="$tmp/diff.nul"
+  fm_lint_write_diff_file "$diff_file" "bin/fm-lint.sh" "README.md"
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
+
+  listed=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_DIFF_FILE="$diff_file" \
+    "$LINT" --changed --list-files 2>"$tmp/err")
+  [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "--changed did not upgrade to the full canonical set when lint tooling changed"
+  assert_contains "$(cat "$tmp/err")" "lint definition files changed" \
+    "--changed upgrade did not explain why it used the full set"
+  pass "fm-lint.sh --changed upgrades to full lint when lint definition files change"
+}
+
+test_empty_changed_partition_is_a_successful_noop() {
+  local tmp fakebin diff_file out rc telemetry roots_log
+  tmp=$(fm_test_tmproot fm-lint-empty-partition)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  fm_lint_stub_shellcheck "$fakebin" "$tmp/shellcheck.log"
+  diff_file="$tmp/diff.nul"
+  telemetry="$tmp/partition-2.tsv"
+  roots_log="$tmp/partition-2.roots.tsv"
+  fm_lint_write_diff_file "$diff_file" "bin/fm-afk-launch.sh"
+
+  rc=0
+  out=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true FM_LINT_JOBS=1 \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_DIFF_FILE="$diff_file" \
+    "$LINT" --changed --partition 2of4 --telemetry "$telemetry" 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "an empty changed partition must exit 0, got $rc"$'\n'"$out"
+  assert_contains "$out" "no lint targets in this partition" \
+    "empty changed partition did not note the empty target set"
+  [ ! -s "$tmp/shellcheck.log" ] || fail "empty partition invoked ShellCheck"
+  [ -f "$telemetry" ] || fail "empty partition wrote no --telemetry snapshot"$'\n'"$out"
+  assert_grep $'format\tfm-lint-telemetry-v1' "$telemetry" \
+    "empty partition telemetry omitted the format marker"
+  assert_grep $'root_count\t0' "$telemetry" \
+    "empty partition telemetry did not record root_count=0"
+  assert_grep $'partition\t2of4' "$telemetry" \
+    "empty partition telemetry did not record its partition"
+  assert_grep $'wall_seconds\t' "$telemetry" \
+    "empty partition telemetry omitted wall_seconds"
+  [ -f "$roots_log" ] || fail "empty partition wrote no roots sidecar beside telemetry"
+  pass "fm-lint.sh treats an empty --changed partition as a successful no-op that still writes telemetry"
+}
+
+test_changed_flag_upgrades_when_a_sourced_helper_changes() {
+  local tmp fakebin listed expected diff_file out
+  tmp=$(fm_test_tmproot fm-lint-sourced-helper)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  diff_file="$tmp/diff.nul"
+  fm_lint_write_diff_file "$diff_file" "bin/fm-wake-lib.sh" "README.md"
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
+
+  listed=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_DIFF_FILE="$diff_file" \
+    "$LINT" --changed --list-files 2>"$tmp/err")
+  [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "--changed did not upgrade to the full canonical set when a sourced helper changed"
+  assert_contains "$(cat "$tmp/err")" "a sourced helper changed" \
+    "--changed upgrade did not explain why a sourced helper used the full set"
+  pass "fm-lint.sh --changed upgrades to full lint when a sourced helper changes"
+}
+
+test_changed_flag_upgrades_when_a_sourced_helper_is_deleted() {
+  local tmp fakebin listed expected status_file
+  tmp=$(fm_test_tmproot fm-lint-deleted-helper)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  status_file="$tmp/name-status"
+  fm_lint_write_name_status "$status_file" $'D\tbin/fm-wake-lib.sh' $'M\tREADME.md'
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
+
+  listed=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_NAME_STATUS_FILE="$status_file" \
+    "$LINT" --changed --list-files 2>"$tmp/err")
+  [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "--changed did not upgrade to the full canonical set when a sourced helper was deleted"
+  assert_contains "$(cat "$tmp/err")" "a sourced helper changed" \
+    "--changed upgrade did not explain why a deleted sourced helper used the full set"
+  pass "fm-lint.sh --changed upgrades to full lint when a sourced helper is deleted"
+}
+
+test_changed_flag_upgrades_when_a_sourced_helper_is_renamed() {
+  local tmp fakebin listed expected status_file
+  tmp=$(fm_test_tmproot fm-lint-renamed-helper)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  status_file="$tmp/name-status"
+  fm_lint_write_name_status "$status_file" \
+    $'R100\tbin/fm-wake-lib.sh\tbin/fm-wake-lib-moved.sh'
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
+
+  listed=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_NAME_STATUS_FILE="$status_file" \
+    "$LINT" --changed --list-files 2>"$tmp/err")
+  [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "--changed did not upgrade to the full canonical set when a sourced helper was renamed"
+  assert_contains "$(cat "$tmp/err")" "a sourced helper changed" \
+    "--changed upgrade did not explain why a renamed sourced helper used the full set"
+  pass "fm-lint.sh --changed upgrades to full lint when a sourced helper is renamed"
+}
+
+test_changed_flag_upgrades_when_a_lint_definition_is_renamed() {
+  local tmp fakebin listed expected status_file
+  tmp=$(fm_test_tmproot fm-lint-renamed-definition)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  status_file="$tmp/name-status"
+  fm_lint_write_name_status "$status_file" \
+    $'R100\tbin/fm-timeout-lib.sh\tbin/fm-timeout-lib-moved.sh' $'M\tREADME.md'
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
+
+  listed=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_NAME_STATUS_FILE="$status_file" \
+    "$LINT" --changed --list-files 2>"$tmp/err")
+  [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "--changed did not upgrade to the full canonical set when a lint definition file was renamed"
+  assert_contains "$(cat "$tmp/err")" "lint definition files changed" \
+    "--changed upgrade did not explain why a renamed lint definition used the full set"
+  pass "fm-lint.sh --changed upgrades to full lint when a lint definition file is renamed"
+}
+
+test_installer_skips_download_when_pinned_binary_is_present() {
+  local tmp fakebin destination out
+  tmp=$(fm_test_tmproot fm-shellcheck-cached)
+  fakebin=$(fm_fakebin "$tmp")
+  destination="$tmp/bin"
+  mkdir -p "$destination"
+  fm_install_stub_uname "$fakebin"
+  fm_install_stub_curl "$fakebin"
+  cat > "$destination/shellcheck" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: ${REQUIRED}\n'
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$destination/shellcheck"
+
+  out=$(CURL_COUNT="$tmp/curl-count" \
+    FM_TEST_UNAME_S=Linux FM_TEST_UNAME_M=x86_64 \
+    PATH="$fakebin:$PATH" "$INSTALLER" "$destination" 2>&1) \
+    || fail "installer failed to reuse a pinned ShellCheck"$'\n'"$out"
+  assert_contains "$out" "already at" "installer did not skip a present pinned binary"
+  [ ! -f "$tmp/curl-count" ] || fail "installer downloaded ShellCheck even though the pin was already present"
+  pass "ShellCheck installer skips download when the pinned binary is already present"
 }
 
 test_local_exclusion_list_covers_every_no_external_sources_code() {
@@ -1532,6 +1778,172 @@ test_root_memory_limit_reports_a_named_death() {
   pass "a root refused by its enforced memory limit fails by name with a memory reason"
 }
 
+test_memory_failure_retries_without_external_sources() {
+  local tmp fakebin fixture out rc log rss_kib require_bounds=0 mode
+  local -a modes=(0)
+  if fm_lint_bounds_supported; then
+    require_bounds=1
+    modes=(1 0)
+  fi
+  tmp=$(fm_test_tmproot fm-lint-memory-fallback)
+  fakebin=$(fm_fakebin "$tmp")
+  fixture="$tmp/teardown.sh"
+  log="$tmp/flags.log"
+  printf '#!/usr/bin/env bash\n# shellcheck source=lib.sh\nexit 0\n' > "$fixture"
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+follow=no
+exclude=none
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  case "$1" in
+    --external-sources) follow=yes ;;
+    --exclude=*) exclude=${1#--exclude=} ;;
+  esac
+  shift
+done
+shift
+printf '%s\t%s\n' "$follow" "$exclude" >> "$FM_TEST_FALLBACK_LOG"
+if [ "$follow" = yes ]; then
+  printf 'shellcheck: Heap exhausted;\n' >&2
+  exit 251
+fi
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+
+  for mode in "${modes[@]}"; do
+    : > "$log"
+    rc=0
+    out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 FM_LINT_REQUIRE_BOUNDS="$mode" \
+      FM_TEST_FALLBACK_LOG="$log" "$LINT" --telemetry "$tmp/pass.$mode.tsv" "$fixture" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "a clean no-source fallback did not pass (bounded=$mode)"$'\n'"$out"
+    assert_grep $'source_directives\t1' "$tmp/pass.$mode.tsv" "telemetry lost the root's source directive"
+    assert_grep $'source_followed_directives\t0' "$tmp/pass.$mode.tsv" \
+      "telemetry counted a source directive that the passing fallback did not follow"
+    [ "$(cat "$log")" = "$(printf 'yes\tnone\nno\tSC1091,SC2034,SC2153,SC2329')" ] \
+      || fail "the memory failure did not retry without external sources and exclude only cross-file codes"$'\n'"$(cat "$log")"
+    assert_contains "$out" "hit the memory ceiling with --external-sources (reason=memory rc=251)" \
+      "the fallback was not identified in the output"
+    assert_contains "$out" "fallback passed with cross-file codes excluded (SC1091,SC2034,SC2153,SC2329)" \
+      "the narrower fallback result was not disclosed"
+    awk -F '\t' '$1 == "end" && $3 ~ /teardown\.sh$/ && $9 == 0 && $10 == "memory-fallback" { found=1 } END { exit !found }' \
+      "$tmp/pass.$mode.roots.tsv" || fail "the clean fallback was not recorded distinctly"
+    rss_kib=$(awk -F '\t' '$1 == "end" && $3 ~ /teardown\.sh$/ { print $11 }' "$tmp/pass.$mode.roots.tsv")
+    if [ "$mode" -eq 1 ]; then
+      assert_grep $'meta\tbounds_enforced\t1' "$tmp/pass.$mode.roots.tsv" \
+        "the bounded fallback did not enforce bounds"
+      case "$rss_kib" in ''|*[!0-9]*) fail "the fallback attempts lost per-root RSS reporting: $rss_kib" ;; esac
+    else
+      assert_grep $'meta\tbounds_enforced\t0' "$tmp/pass.$mode.roots.tsv" \
+        "the unbounded fallback unexpectedly enforced bounds"
+      [ "$rss_kib" = unavailable ] || fail "the unbounded fallback unexpectedly reported RSS: $rss_kib"
+    fi
+  done
+
+  if ! pinned_ready; then
+    pass "SKIP (ShellCheck $REQUIRED not resolved): real fallback finding check"
+    return
+  fi
+  local real_shellcheck
+  real_shellcheck=$(command -v shellcheck)
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  exec "$FM_REAL_SHELLCHECK" "$@"
+fi
+for arg in "$@"; do
+  if [ "$arg" = --external-sources ]; then
+    printf 'shellcheck: Heap exhausted;\n' >&2
+    exit 251
+  fi
+done
+exec "$FM_REAL_SHELLCHECK" "$@"
+SH
+  chmod +x "$fakebin/shellcheck"
+  # shellcheck disable=SC2016 # The fixture intentionally contains an unexpanded parameter.
+  printf '#!/usr/bin/env bash\nx=$1\nprintf "%%s\\n" $x\n' > "$fixture"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_REAL_SHELLCHECK="$real_shellcheck" \
+    FM_LINT_JOBS=1 FM_LINT_REQUIRE_BOUNDS="$require_bounds" \
+    "$LINT" --telemetry "$tmp/finding.tsv" "$fixture" 2>&1) || rc=$?
+  [ "$rc" -eq 1 ] || fail "a real ShellCheck finding in the fallback did not fail lint (exit $rc)"$'\n'"$out"
+  assert_contains "$out" "fallback reason=findings rc=1" \
+    "the fallback finding was not identified"
+  assert_contains "$out" "SC2086" "the real fallback finding was not reported"
+  awk -F '\t' '$1 == "end" && $3 ~ /teardown\.sh$/ && $9 == 1 && $10 == "findings" { found=1 } END { exit !found }' \
+    "$tmp/finding.roots.tsv" || fail "the fallback finding was not recorded as a failure"
+  pass "memory failures retry without source following, exclude cross-file codes, and preserve a real fallback finding"
+}
+
+test_memory_fallback_spends_only_the_remaining_root_deadline() {
+  if ! fm_lint_bounds_supported; then
+    pass "SKIP (host cannot enforce the bounded envelope): fallback deadline check"
+    return
+  fi
+  local tmp fakebin fixture log out rc duration_ms
+  tmp=$(fm_test_tmproot fm-lint-fallback-deadline)
+  fakebin=$(fm_fakebin "$tmp")
+  fixture="$tmp/teardown.sh"
+  log="$tmp/attempts.log"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture"
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+for arg in "$@"; do
+  if [ "$arg" = --external-sources ]; then
+    printf 'follow\n' >> "$FM_TEST_ATTEMPT_LOG"
+    sleep "$FM_TEST_FIRST_SECS"
+    printf 'shellcheck: Heap exhausted;\n' >&2
+    exit 251
+  fi
+done
+printf 'fallback\n' >> "$FM_TEST_ATTEMPT_LOG"
+sleep 60
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+
+  # A 3s first attempt leaves about 3s of the 6s deadline, so the retry is
+  # killed there; a fresh deadline would let the root run for about 9s.
+  : > "$log"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 FM_LINT_REQUIRE_BOUNDS=1 \
+    FM_LINT_ROOT_SECONDS=6 FM_LINT_ROOT_GRACE=1 \
+    FM_TEST_ATTEMPT_LOG="$log" FM_TEST_FIRST_SECS=3 \
+    "$LINT" --telemetry "$tmp/partial.tsv" "$fixture" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a fallback cut off by the root deadline unexpectedly passed"
+  [ "$(cat "$log")" = "$(printf 'follow\nfallback')" ] \
+    || fail "the root did not retry once with its remaining time"$'\n'"$(cat "$log")"
+  assert_contains "$out" "fallback reason=timeout" \
+    "the fallback was not stopped by the root's remaining deadline"$'\n'"$out"
+  duration_ms=$(awk -F '\t' '$1 == "end" && $3 ~ /teardown\.sh$/ { print $8 }' "$tmp/partial.roots.tsv")
+  [ "$duration_ms" -lt 7000 ] \
+    || fail "the first attempt and fallback together exceeded the root deadline plus grace: ${duration_ms}ms"
+
+  # With under a second of the deadline left, no retry starts.
+  : > "$log"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 FM_LINT_REQUIRE_BOUNDS=1 \
+    FM_LINT_ROOT_SECONDS=6 FM_LINT_ROOT_GRACE=1 \
+    FM_TEST_ATTEMPT_LOG="$log" FM_TEST_FIRST_SECS=5.2 \
+    "$LINT" --telemetry "$tmp/spent.tsv" "$fixture" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a memory failure with no deadline left unexpectedly passed"
+  [ "$(cat "$log")" = follow ] \
+    || fail "a fallback started with no time left in the root deadline"$'\n'"$(cat "$log")"
+  assert_contains "$out" "no time left in its 6s deadline to retry without it" \
+    "the skipped fallback was not explained"$'\n'"$out"
+  awk -F '\t' '$1 == "end" && $3 ~ /teardown\.sh$/ && $10 == "memory" && $12 == 1 { found=1 } END { exit !found }' \
+    "$tmp/spent.roots.tsv" || fail "the unretried memory failure was not recorded as a source-following memory failure"
+  pass "a memory fallback runs only within the time left in its root's original deadline"
+}
+
 test_memory_evidence_outranks_findings_and_signal_reasons() {
   local tmp fakebin roots_log out rc name reason bounded
   local -a roots modes
@@ -1800,13 +2212,8 @@ test_seeded_module_boundary_parity() {
     pass "SKIP (ShellCheck $REQUIRED not resolved): seeded source-boundary parity check"
     return
   fi
-  local tmp rel adapter dispatcher dep owner test_root out rc
-  tmp=$(mktemp -d "$ROOT/.fm-lint-parity.XXXXXX")
-  if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
-    trap fm_test_cleanup EXIT
-  fi
-  FM_TEST_CLEANUP_DIRS+=("$tmp")
-  rel=${tmp#"$ROOT/"}
+  local tmp adapter dispatcher dep owner test_root out rc
+  tmp=$(fm_test_tmproot fm-lint-parity)
   adapter="$tmp/adapter.sh"
   dispatcher="$tmp/dispatcher.sh"
   dep="$tmp/owner-dep.sh"
@@ -1834,7 +2241,7 @@ owner_dependency_value=ok
 SH
   cat > "$owner" <<SH
 #!/usr/bin/env bash
-# shellcheck source=$rel/owner-dep.sh
+# shellcheck source=$dep
 . "$dep"
 owner_bad() {
   printf '%s\n' "\$owner_dependency_value"
@@ -1875,6 +2282,7 @@ test_ci_rejects_explicit_fast_mode
 test_fast_mode_catches_a_real_lint_defect
 test_pins_an_explicit_version
 test_installer_retries_transient_download_failure
+test_installer_skips_download_when_pinned_binary_is_present
 test_installer_selects_platform_archive_url_and_checksum
 test_installer_rejects_wrong_checksum
 test_installer_falls_back_to_shasum
@@ -1891,6 +2299,8 @@ test_jobs_are_deterministic_and_complete
 test_worker_trees_stop_on_signal
 test_root_deadline_names_the_root_and_reaps_the_tree
 test_root_memory_limit_reports_a_named_death
+test_memory_failure_retries_without_external_sources
+test_memory_fallback_spends_only_the_remaining_root_deadline
 test_memory_evidence_outranks_findings_and_signal_reasons
 test_source_excerpt_with_oom_text_stays_findings
 test_require_bounds_refuses_when_enforcement_is_missing
@@ -1912,4 +2322,11 @@ test_merge_base_less_keeps_external_sources
 test_explicit_path_keeps_external_sources
 test_fast_mode_on_a_local_branch_keeps_source_following
 test_changed_mode_hides_cross_file_codes_that_ci_still_sees
+test_changed_flag_keeps_source_following_in_ci
+test_changed_flag_upgrades_when_lint_definition_changes
+test_changed_flag_upgrades_when_a_sourced_helper_changes
+test_changed_flag_upgrades_when_a_sourced_helper_is_deleted
+test_changed_flag_upgrades_when_a_sourced_helper_is_renamed
+test_changed_flag_upgrades_when_a_lint_definition_is_renamed
+test_empty_changed_partition_is_a_successful_noop
 test_local_exclusion_list_covers_every_no_external_sources_code
